@@ -10,8 +10,15 @@ import re
 from typing import Any, Final, NewType, Required, TypedDict, override
 
 import aiofiles.os
-from nio import AsyncClient, Event, MatrixRoom
-from nio.events.room_events import ReactionEvent, RoomMessageText
+from nio import AsyncClient, AsyncClientConfig, Event, MatrixRoom
+from nio.crypto import ENCRYPTION_ENABLED
+from nio.events.room_events import MegolmEvent, ReactionEvent, RoomMessageText
+from nio.exceptions import (
+    EncryptionError,
+    GroupEncryptionError,
+    OlmTrustError,
+    ProtocolError,
+)
 from nio.responses import (
     ErrorResponse,
     JoinError,
@@ -59,6 +66,12 @@ from .services import async_setup_services
 _LOGGER = logging.getLogger(__name__)
 
 SESSION_FILE = ".matrix.conf"
+# Holds the device's encryption keys. Losing it makes the bot a new device.
+STORE_DIR = ".matrix_store"
+# Key of the device IDs in the session file, next to the per-user tokens.
+SESSION_DEVICE_IDS = "device_ids"
+# How long a message waits for the login and first sync after a restart.
+STARTUP_TIMEOUT = 60
 
 CONF_HOMESERVER: Final = "homeserver"
 CONF_ROOMS: Final = "rooms"
@@ -218,6 +231,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     hass.data[DOMAIN] = MatrixBot(
         hass,
         os.path.join(hass.config.path(), SESSION_FILE),
+        hass.config.path(STORE_DIR),
         config[CONF_HOMESERVER],
         config[CONF_VERIFY_SSL],
         config[CONF_USERNAME],
@@ -240,6 +254,7 @@ class MatrixBot:
         self,
         hass: HomeAssistant,
         config_file: str,
+        store_path: str,
         homeserver: str,
         verify_ssl: bool,
         username: str,
@@ -258,8 +273,19 @@ class MatrixBot:
         self._mx_id = username
         self._password = password
 
+        # The client only gets its store path in _open_encryption_store: nio
+        # would otherwise open the store, which reads files, in the event loop
+        # as soon as it learns its device ID.
+        self._store_path = store_path
+        # Set once the login, key store and first sync are done (or failed).
+        # Nothing is sent before that: until then the client does not know
+        # which rooms are encrypted and would send to them in the clear.
+        self._startup_done = asyncio.Event()
         self._client = AsyncClient(
-            homeserver=self._homeserver, user=self._mx_id, ssl=self._verify_tls
+            homeserver=self._homeserver,
+            user=self._mx_id,
+            ssl=self._verify_tls,
+            config=AsyncClientConfig(encryption_enabled=ENCRYPTION_ENABLED),
         )
 
         self._listening_rooms: dict[RoomAnyID, RoomID] = {}
@@ -277,29 +303,36 @@ class MatrixBot:
 
         async def handle_startup(event: HassEvent) -> None:
             """Run once when Home Assistant finished startup."""
-            self._access_tokens = await self._get_auth_tokens()
-            await self._login()
-            await self._resolve_room_aliases(listening_rooms)
-            self._load_commands(commands)
-            await self._join_rooms()
+            try:
+                self._access_tokens = await self._get_auth_tokens()
+                await self._login()
+                await self._open_encryption_store()
+                await self._resolve_room_aliases(listening_rooms)
+                self._load_commands(commands)
+                await self._join_rooms()
 
-            # Sync once so that we don't respond to past events.
-            _LOGGER.debug("Starting initial sync for %s", self._mx_id)
-            await self._client.sync(timeout=30_000)
-            _LOGGER.debug("Finished initial sync for %s", self._mx_id)
+                # Sync once so that we don't respond to past events.
+                _LOGGER.debug("Starting initial sync for %s", self._mx_id)
+                await self._client.sync(timeout=30_000)
+                _LOGGER.debug("Finished initial sync for %s", self._mx_id)
 
-            self._client.add_event_callback(
-                self._handle_room_message, (ReactionEvent, RoomMessageText)
-            )
+                self._client.add_event_callback(
+                    self._handle_room_message, (ReactionEvent, RoomMessageText)
+                )
+                self._client.add_event_callback(
+                    self._handle_undecrypted_message, MegolmEvent
+                )
 
-            _LOGGER.debug("Starting sync_forever for %s", self._mx_id)
-            self.hass.async_create_background_task(
-                self._client.sync_forever(
-                    timeout=30_000,
-                    loop_sleep_time=1_000,
-                ),  # milliseconds.
-                name=f"{self.__class__.__name__}: sync_forever for '{self._mx_id}'",
-            )
+                _LOGGER.debug("Starting sync_forever for %s", self._mx_id)
+                self.hass.async_create_background_task(
+                    self._client.sync_forever(
+                        timeout=30_000,
+                        loop_sleep_time=1_000,
+                    ),  # milliseconds.
+                    name=f"{self.__class__.__name__}: sync_forever for '{self._mx_id}'",
+                )
+            finally:
+                self._startup_done.set()
 
         self.hass.bus.async_listen_once(EVENT_HOMEASSISTANT_START, handle_startup)
 
@@ -390,6 +423,19 @@ class MatrixBot:
             }
 
             self.hass.bus.async_fire(EVENT_MATRIX_COMMAND, message_data)
+
+    async def _handle_undecrypted_message(
+        self, room: MatrixRoom, message: Event
+    ) -> None:
+        """Report a message the bot has no key for.
+
+        Decrypted messages reach _handle_room_message as ordinary events.
+        """
+        _LOGGER.warning(
+            "Unable to decrypt a message from '%s' in room '%s'",
+            message.sender,
+            room.room_id,
+        )
 
     def _get_thread_parent(self, message: RoomMessageText) -> str | None:
         """Get the thread parent ID from a message, or None if not in a thread."""
@@ -485,6 +531,11 @@ class MatrixBot:
     async def _store_auth_token(self, token: str) -> None:
         """Store authentication token to session and persistent storage."""
         self._access_tokens[self._mx_id] = token
+        # The device ID lets a later password login come back as the same
+        # device, which keeps its encryption keys usable.
+        device_ids = self._access_tokens.setdefault(SESSION_DEVICE_IDS, {})
+        if isinstance(device_ids, dict):
+            device_ids[self._mx_id] = self._client.device_id
 
         await self.hass.async_add_executor_job(
             save_json,
@@ -493,22 +544,39 @@ class MatrixBot:
             True,  # private=True
         )
 
+    def _stored_device_id(self) -> str:
+        """Return the device ID of the last login, if known."""
+        device_ids = self._access_tokens.get(SESSION_DEVICE_IDS)
+        if isinstance(device_ids, dict):
+            return str(device_ids.get(self._mx_id) or "")
+        return ""
+
+    def _has_key_store(self, device_id: str) -> bool:
+        """Return if the device has encryption keys on disk."""
+        # The file name is nio's default for its SQLite store.
+        return os.path.exists(
+            os.path.join(self._store_path, f"{self._mx_id}_{device_id}.db")
+        )
+
     async def _login(self) -> None:
         """Log in to the Matrix homeserver.
 
         Attempts to use the stored access token.
         If that fails, then tries using the password.
         If that also fails, raises LocalProtocolError.
+
+        With encryption available, a login is only kept if the key store of its
+        device exists. A device whose keys are not on disk is logged out and
+        replaced by a new one: publishing new keys under an existing device ID
+        makes other clients reject the device.
         """
 
         # If we have an access token
         if (token := self._access_tokens.get(self._mx_id)) is not None:
             _LOGGER.debug("Restoring login from stored access token")
-            self._client.restore_login(
-                user_id=self._client.user_id,
-                device_id=self._client.device_id,
-                access_token=token,
-            )
+            # The device ID belonging to the token is needed to open the
+            # encryption store, and only the homeserver knows it.
+            self._client.access_token = token
             response = await self._client.whoami()
             if isinstance(response, WhoamiError):
                 _LOGGER.warning(
@@ -520,16 +588,46 @@ class MatrixBot:
                     ""  # Force a soft-logout if the homeserver didn't.
                 )
             elif isinstance(response, WhoamiResponse):
+                # whoami stored the token's user and device ID on the client.
                 _LOGGER.debug(
                     "Successfully restored login from access token:"
                     " user_id '%s', device_id '%s'",
                     response.user_id,
                     response.device_id,
                 )
+                if (
+                    ENCRYPTION_ENABLED
+                    and response.device_id
+                    and not await self.hass.async_add_executor_job(
+                        self._has_key_store, response.device_id
+                    )
+                ):
+                    _LOGGER.warning(
+                        "Device '%s' has no encryption keys on disk,"
+                        " replacing it with a new device",
+                        response.device_id,
+                    )
+                    await self._client.logout()
+                    self._client.access_token = ""
+                    self._client.device_id = ""
 
         # If the token login did not succeed
         if not self._client.logged_in:
-            response = await self._client.login(password=self._password)
+            # Come back as the previous device while its keys are still here,
+            # otherwise as a new one.
+            device_id = self._stored_device_id()
+            if not (
+                ENCRYPTION_ENABLED
+                and device_id
+                and await self.hass.async_add_executor_job(
+                    self._has_key_store, device_id
+                )
+            ):
+                device_id = ""
+            self._client.device_id = device_id
+            response = await self._client.login(
+                password=self._password, device_name="Home Assistant"
+            )
             _LOGGER.debug("Logging in using password")
 
             if isinstance(response, LoginError):
@@ -546,15 +644,123 @@ class MatrixBot:
 
         await self._store_auth_token(self._client.access_token)
 
+    def _load_encryption_store(self) -> None:
+        """Open the device's key store, creating it on first use."""
+        os.makedirs(self._store_path, mode=0o700, exist_ok=True)
+        self._client.store_path = self._store_path
+        self._client.load_store()
+
+    async def _open_encryption_store(self) -> None:
+        """Enable encryption for the logged in device.
+
+        On any failure the client is left without encryption, and
+        _refusal_reason then keeps messages out of encrypted rooms.
+        """
+        if not ENCRYPTION_ENABLED:
+            _LOGGER.error(
+                "The encryption dependencies are not installed,"
+                " messages to encrypted rooms will be refused"
+            )
+            return
+        if not self._client.device_id:
+            _LOGGER.error(
+                "The login is not bound to a device,"
+                " messages to encrypted rooms will be refused"
+            )
+            return
+        try:
+            # Opening the store reads files. Later reads and writes are small
+            # SQLite operations that nio does in the event loop.
+            await self.hass.async_add_executor_job(self._load_encryption_store)
+        except Exception:
+            _LOGGER.exception(
+                "Unable to open the encryption key store,"
+                " messages to encrypted rooms will be refused"
+            )
+            return
+        # Publish the device's keys so that others can encrypt to it. The sync
+        # loop retries this if it fails here.
+        try:
+            if self._client.should_upload_keys:
+                response = await self._client.keys_upload()
+                if isinstance(response, ErrorResponse):
+                    _LOGGER.error("Unable to upload encryption keys: %s", response)
+        except (ProtocolError, EncryptionError) as err:
+            _LOGGER.error("Unable to upload encryption keys: %s", err)
+
+    async def _wait_for_startup(self) -> bool:
+        """Wait until the client knows its rooms. Return False on timeout."""
+        if self._startup_done.is_set():
+            return True
+        try:
+            async with asyncio.timeout(STARTUP_TIMEOUT):
+                await self._startup_done.wait()
+        except TimeoutError:
+            return False
+        return True
+
+    def _refusal_reason(self, target_room: RoomAnyID) -> str | None:
+        """Return why nothing may be sent to the room, or None if it may.
+
+        nio sends in the clear whenever it has no encryption set up, even to a
+        room it knows to be encrypted, so that case is refused here.
+        """
+        if not self._client.logged_in:
+            return "the bot is not logged in"
+        room = self._client.rooms.get(
+            self._listening_rooms.get(target_room, target_room)
+        )
+        if room is None:
+            return "the bot is not in this room"
+        if room.encrypted and self._client.olm is None:
+            return "the room is encrypted and encryption is unavailable"
+        return None
+
+    def _is_encrypted_room(self, target_room: RoomAnyID) -> bool:
+        """Return if messages to the room are sent encrypted."""
+        if self._client.olm is None:
+            return False
+        room = self._client.rooms.get(
+            self._listening_rooms.get(target_room, target_room)
+        )
+        return room is not None and room.encrypted
+
     async def _handle_room_send(
         self, target_room: RoomAnyID, message_type: str, content: dict
     ) -> None:
         """Wrap _client.room_send and handle ErrorResponses."""
-        response: Response = await self._client.room_send(
-            room_id=self._listening_rooms.get(target_room, target_room),
-            message_type=message_type,
-            content=content,
-        )
+        if not await self._wait_for_startup():
+            _LOGGER.error(
+                "Unable to deliver message to room '%s':"
+                " Matrix has not finished starting",
+                target_room,
+            )
+            return
+        if (reason := self._refusal_reason(target_room)) is not None:
+            _LOGGER.error(
+                "Unable to deliver message to room '%s': %s", target_room, reason
+            )
+            return
+        room_id = self._listening_rooms.get(target_room, target_room)
+        try:
+            # A bot cannot verify devices interactively, so encrypted rooms
+            # get the message for every device in the room.
+            response: Response = await self._client.room_send(
+                room_id=room_id,
+                message_type=message_type,
+                content=content,
+                ignore_unverified_devices=True,
+            )
+        except (
+            ProtocolError,
+            EncryptionError,
+            GroupEncryptionError,
+            OlmTrustError,
+        ) as err:
+            _LOGGER.error(
+                "Unable to deliver message to room '%s': %s", target_room, err
+            )
+            return
         if isinstance(response, ErrorResponse):
             _LOGGER.error(
                 "Unable to deliver message to room '%s': %s",
@@ -563,6 +769,26 @@ class MatrixBot:
             )
         else:
             _LOGGER.debug("Message delivered to room '%s'", target_room)
+            self._warn_if_unreadable(room_id, target_room)
+
+    def _warn_if_unreadable(self, room_id: RoomID, target_room: RoomAnyID) -> None:
+        """Warn when an encrypted message was shared with no one.
+
+        nio reports success even if it had no device keys to encrypt for.
+        """
+        if not self._is_encrypted_room(target_room):
+            return
+        session = self._client.olm.outbound_group_sessions.get(room_id)
+        if (
+            session is not None
+            and not session.users_shared_with
+            and len(self._client.rooms[room_id].users) > 1
+        ):
+            _LOGGER.warning(
+                "The message to room '%s' was encrypted for no other device,"
+                " nobody will be able to read it",
+                target_room,
+            )
 
     async def _handle_multi_room_send(
         self, target_rooms: Sequence[RoomAnyID], message_type: str, content: dict
@@ -598,44 +824,75 @@ class MatrixBot:
         mime_type = mimetypes.guess_type(image_path)[0]
         file_stat = await aiofiles.os.stat(image_path)
 
-        _LOGGER.debug("Uploading file from path, %s", image_path)
-        async with aiofiles.open(image_path, "rb") as image_file:
-            response, _ = await self._client.upload(
-                image_file,
-                content_type=mime_type,
-                filename=os.path.basename(image_path),
-                filesize=file_stat.st_size,
-            )
-        if isinstance(response, UploadError):
-            _LOGGER.error("Unable to upload image to the homeserver: %s", response)
-            return
-        if isinstance(response, UploadResponse):
-            _LOGGER.debug("Successfully uploaded image to the homeserver")
-        else:
-            _LOGGER.error(
-                "Unknown response received when uploading image to homeserver: %s",
-                response,
-            )
-            return
-
-        content = {
-            "body": os.path.basename(image_path),
-            "info": {
-                "size": file_stat.st_size,
-                "mimetype": mime_type,
-                "w": width,
-                "h": height,
-            },
-            "msgtype": "m.image",
-            "url": response.content_uri,
+        info = {
+            "size": file_stat.st_size,
+            "mimetype": mime_type,
+            "w": width,
+            "h": height,
         }
+        if not await self._wait_for_startup():
+            _LOGGER.error(
+                "Unable to send image '%s': Matrix has not finished starting",
+                image_path,
+            )
+            return
 
-        if thread_id is not None:
-            content["m.relates_to"] = {"event_id": thread_id, "rel_type": "m.thread"}
+        # An encrypted room needs an encrypted upload, so the image is uploaded
+        # once for the encrypted rooms and once for the others. Rooms that
+        # cannot be sent to are dropped before anything is uploaded.
+        encrypted_rooms: list[RoomAnyID] = []
+        plain_rooms: list[RoomAnyID] = []
+        for room in target_rooms:
+            if (reason := self._refusal_reason(room)) is not None:
+                _LOGGER.error("Unable to send image to room '%s': %s", room, reason)
+            elif self._is_encrypted_room(room):
+                encrypted_rooms.append(room)
+            else:
+                plain_rooms.append(room)
 
-        await self._handle_multi_room_send(
-            target_rooms=target_rooms, message_type="m.room.message", content=content
-        )
+        for rooms, encrypt in ((plain_rooms, False), (encrypted_rooms, True)):
+            if not rooms:
+                continue
+            _LOGGER.debug("Uploading file from path, %s", image_path)
+            async with aiofiles.open(image_path, "rb") as image_file:
+                response, decryption_keys = await self._client.upload(
+                    image_file,
+                    content_type=mime_type,
+                    filename=os.path.basename(image_path),
+                    encrypt=encrypt,
+                    filesize=file_stat.st_size,
+                )
+            if isinstance(response, UploadError):
+                _LOGGER.error("Unable to upload image to the homeserver: %s", response)
+                continue
+            if isinstance(response, UploadResponse):
+                _LOGGER.debug("Successfully uploaded image to the homeserver")
+            else:
+                _LOGGER.error(
+                    "Unknown response received when uploading image to homeserver: %s",
+                    response,
+                )
+                continue
+
+            content: dict[str, Any] = {
+                "body": os.path.basename(image_path),
+                "info": info,
+                "msgtype": "m.image",
+            }
+            if decryption_keys is not None:
+                content["file"] = {"url": response.content_uri, **decryption_keys}
+            else:
+                content["url"] = response.content_uri
+
+            if thread_id is not None:
+                content["m.relates_to"] = {
+                    "event_id": thread_id,
+                    "rel_type": "m.thread",
+                }
+
+            await self._handle_multi_room_send(
+                target_rooms=rooms, message_type="m.room.message", content=content
+            )
 
     async def _send_message(
         self, message: str, target_rooms: list[RoomAnyID], data: dict | None

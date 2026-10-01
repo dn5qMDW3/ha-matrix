@@ -16,4 +16,5 @@ ATTR_REACTION = "reaction"  # reaction
 ATTR_ROOM = "room"  # room id
 ATTR_MESSAGE_ID = "message_id"  # message id
 
-CONF_ROOMS_REGEX = "^[!|#][^:]*:.*"
+# Room IDs lost their ":server" part in room version 12; aliases still have it.
+CONF_ROOMS_REGEX = "^(![^:]+(:.+)?|#[^:]*:.+)$"
